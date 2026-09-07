@@ -1,0 +1,5 @@
+{
+  "TX9988": { "customer_id": "C1001", "amount": 4999, "status": "SUCCESS" },
+  "TX9989": { "customer_id": "C1002", "amount": 2999, "status": "UNKNOWN" },
+  "TX9990": { "customer_id": "C1003", "amount": 3499, "status": "SUCCESS" }
+}

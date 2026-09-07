@@ -1,0 +1,5 @@
+{
+  "O5001": { "customer_id": "C1001", "product_id": "LAPTOP001", "status": "NOT_CREATED" },
+  "O5002": { "customer_id": "C1002", "product_id": "LAPTOP001", "status": "NOT_CREATED" },
+  "O5003": { "customer_id": "C1003", "product_id": "LAPTOP001", "status": "NOT_CREATED" }
+}

@@ -1,0 +1,11 @@
+# Core graph runtime
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# Real LLM backend (only needed when RESOLVEAI_LLM_MODE=anthropic)
+anthropic>=0.40.0
+
+# Env-file loading for config.py
+python-dotenv>=1.0.0
+
+# NOTE: sqlite3 is in the Python standard library - no dependency here.
