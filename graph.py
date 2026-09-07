@@ -137,11 +137,13 @@ _PLAN_BY_INTENT: dict[str, list[str]] = {
 def planner_node(state: AgentState) -> dict:
     """Classify the intent (llm_client), pull IDs from the task, pick the tools.
 
-    Before deriving a tool list from scratch, ask memory_store for the most
-    recent *successful* episode with this same intent. If one exists, reuse its
-    stored tool order verbatim (a "memory hit") instead of re-deriving; the
-    trace records exactly which episode was reused. With nothing to reuse (a
-    "memory miss") it falls back to the intent-keyed default plan.
+    Before deriving a tool list from scratch, ask memory_store for the
+    highest-*confidence* strategy recorded for this intent
+    (best_strategy_for: success_count / times_used, tie-broken by average
+    score then recency - not merely the newest successful episode). If one
+    exists, reuse its stored tool order verbatim (a "memory hit") and record
+    the confidence in the trace. With nothing on record (a "memory miss") it
+    falls back to the intent-keyed default plan.
     """
     task = state.get("task", "")
 
@@ -160,16 +162,24 @@ def planner_node(state: AgentState) -> dict:
     if state.get("customer_id"):                     # explicit input wins
         found_ids["customer_id"] = state["customer_id"]
 
-    prior = memory_store.get_successful_strategy(intent)
+    prior = memory_store.best_strategy_for(intent)
     if prior:
         planned_tools = list(prior["strategy"])
-        memory_decision = (
-            f"Memory hit: reusing strategy from episode #{prior['id']}, "
-            f"tool order: {planned_tools}"
-        )
+        pct = round(prior["confidence"] * 100)
+        ok, used = prior["success_count"], prior["times_used"]
+        if prior["confidence"] >= 1.0:
+            memory_decision = (
+                f"Memory hit: strategy confidence {pct}% ({ok}/{used} successful), "
+                f"avg score {prior['avg_score']:.2f} — reusing"
+            )
+        else:
+            memory_decision = (
+                f"Memory hit: strategy confidence {pct}% ({ok}/{used} successful) — "
+                f"still the best on record, reusing"
+            )
     else:
         planned_tools = list(_PLAN_BY_INTENT.get(intent, _DEFAULT_PLAN))
-        memory_decision = "Memory miss: no prior strategy found, deriving fresh."
+        memory_decision = "Memory miss: no prior strategy for this intent, deriving fresh."
 
     line = f"PLANNER   intent={intent!r}  ids={found_ids or '{}'}  plan={planned_tools}"
     return {
@@ -357,13 +367,70 @@ def replan_node(state: AgentState) -> dict:
     return {"retry_count": retry_count, "trace": [line]}
 
 
+def _conf_digest(s: dict | None) -> dict | None:
+    """The inspectable slice of a best_strategy_for() result for the record."""
+    if not s:
+        return None
+    return {
+        "strategy": s["strategy"],
+        "confidence": round(s["confidence"], 3),
+        "successes": f"{s['success_count']}/{s['times_used']}",
+        "avg_score": round(s["avg_score"], 3),
+    }
+
+
+def _confidence_shift_line(
+    strategy: list[str],
+    before: dict | None,
+    after: dict | None,
+    succeeded: bool,
+) -> str:
+    """One trace line: did this episode reinforce or weaken the favored strategy?
+
+    `before` / `after` are memory_store.best_strategy_for(intent) taken either
+    side of the episode write. "Favored" means the strategy that was best on
+    record *before* this episode landed.
+    """
+    if before is None:
+        pct = round((after or {}).get("confidence", 0.0) * 100)
+        return (
+            "MEMORY    no strategy was on record for this intent; this episode "
+            f"sets the baseline (confidence {pct}%)"
+        )
+
+    before_pct = round(before["confidence"] * 100)
+    if list(strategy) == list(before["strategy"]):
+        won = 1 if succeeded else 0
+        new_ok = before["success_count"] + won
+        new_used = before["times_used"] + 1
+        verb = "reinforced" if succeeded else "weakened"
+        return (
+            f"MEMORY    this episode {verb} the favored strategy: confidence "
+            f"{before_pct}% -> {round(new_ok / new_used * 100)}% "
+            f"({new_ok}/{new_used} successful)"
+        )
+
+    if after and list(after["strategy"]) != list(before["strategy"]):
+        return (
+            "MEMORY    this episode's tool order overtook the favorite: new "
+            f"favored confidence {round(after['confidence'] * 100)}% "
+            f"(was {before_pct}% on a different tool order)"
+        )
+    return (
+        "MEMORY    favored strategy untouched (this episode used a different "
+        f"tool order); its confidence holds at {before_pct}%"
+    )
+
+
 def memory_node(state: AgentState) -> dict:
-    """Persist this episode to the SQLite `episodes` table, then expose the record.
+    """Persist this episode to SQLite, upsert its strategy aggregate, expose the record.
 
     Terminal node. The strategy stored is the *ordered tool list* actually
     planned; the score is checks_passed / total_checks. memory_store.store_episode
-    opens config.DB_PATH, INSERTs, and commits - this is a real file on disk,
-    not in-process state.
+    opens config.DB_PATH, INSERTs the episode, upserts the matching `strategies`
+    row (times_used / success_count / total_score / last_used_at) and commits -
+    a real file on disk, not in-process state. The trace then records whether
+    this episode reinforced or weakened the strategy that was favored going in.
     """
     verdict = state.get("verdict", "FAIL")
     succeeded = verdict == "PASS"
@@ -372,14 +439,18 @@ def memory_node(state: AgentState) -> dict:
     score = round(checks_passed / total_checks, 3)
     strategy = list(state.get("planned_tools", []))          # tool order
     resolution = state.get("proposed_resolution", {})
+    intent = state.get("intent", "unknown")
 
+    favored_before = memory_store.best_strategy_for(intent)
     episode_id = memory_store.store_episode(
-        intent=state.get("intent", "unknown"),
+        intent=intent,
         strategy=strategy,
         resolution=resolution,
         score=score,
         succeeded=succeeded,
     )
+    favored_after = memory_store.best_strategy_for(intent)
+    shift_line = _confidence_shift_line(strategy, favored_before, favored_after, succeeded)
 
     record = {
         "episode_id": episode_id,
@@ -403,12 +474,17 @@ def memory_node(state: AgentState) -> dict:
         },
         "retry_count": state.get("retry_count", 0),
         "resolved": succeeded,
+        "strategy_confidence": {
+            "note": shift_line.replace("MEMORY    ", ""),
+            "favored_before": _conf_digest(favored_before),
+            "favored_after": _conf_digest(favored_after),
+        },
     }
     line = (
         f"MEMORY    committed episode #{episode_id} to {config.DB_PATH.name}  "
         f"succeeded={succeeded}  score={score}"
     )
-    return {"memory_record": record, "trace": [line]}
+    return {"memory_record": record, "trace": [line, shift_line]}
 
 
 # --------------------------------------------------------------------------- #

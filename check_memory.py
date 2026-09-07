@@ -13,6 +13,8 @@ What it does:
     3. queries `episodes` for intent = 'payment_order_mismatch'
     4. prints the stored strategy (tool order), resolution, critic score and
        success flag for BOTH episodes (Rahul / C1001 and Ananya / C1002)
+    5. rolls the episodes up via get_strategy_stats(INTENT) - the aggregate
+       (intent, tool order) confidence the Planner actually decides on
 """
 
 from __future__ import annotations
@@ -24,6 +26,57 @@ import config
 
 INTENT = "payment_order_mismatch"
 NAMES = {"C1001": "Rahul Sharma", "C1002": "Ananya Rao", "C1003": "Karthik Iyer"}
+
+
+def get_strategy_stats(intent: str) -> list[dict]:
+    """Aggregate confidence per distinct strategy (tool order) for an intent.
+
+    Reads the `strategies` table that memory_store upserts on every episode
+    write and returns one dict per tool order, best-first by the SAME ranking
+    memory_store.best_strategy_for() uses: confidence (success_count /
+    times_used), then average score, then most recent use. Complements the
+    raw per-episode list with the rolled-up view the Planner reuses from.
+
+    Each dict: strategy, times_used, success_count, confidence, avg_score,
+    last_used_at. Returns [] if the db or the strategies table is absent.
+    """
+    db = config.DB_PATH
+    if not db.exists():
+        return []
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategies'"
+        ).fetchone()
+        if not has_table:
+            return []
+        rows = conn.execute(
+            "SELECT tool_order, times_used, success_count, total_score, last_used_at "
+            "FROM strategies WHERE intent = ?",
+            (intent,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    stats: list[dict] = []
+    for r in rows:
+        used = r["times_used"] or 1
+        stats.append(
+            {
+                "strategy": json.loads(r["tool_order"]),
+                "times_used": r["times_used"],
+                "success_count": r["success_count"],
+                "confidence": r["success_count"] / used,
+                "avg_score": r["total_score"] / used,
+                "last_used_at": r["last_used_at"],
+            }
+        )
+    stats.sort(
+        key=lambda s: (s["confidence"], s["avg_score"], s["last_used_at"] or ""),
+        reverse=True,
+    )
+    return stats
 
 
 def main() -> None:
@@ -70,6 +123,24 @@ def main() -> None:
         print(f"  resolution    : {resolution.get('action')}   args = {resolution.get('args')}")
         print(f"  critic score  : {r['score']}")
         print(f"  success flag  : {r['succeeded']}  ({'PASS' if r['succeeded'] else 'FAIL'})")
+
+    print("\n" + "-" * 74)
+    print(f"aggregate strategy confidence  (intent = {INTENT!r})")
+    print("-" * 74)
+    stats = get_strategy_stats(INTENT)
+    if not stats:
+        print("  (no 'strategies' table yet - run `python main.py` first)")
+    else:
+        for i, s in enumerate(stats):
+            pct = round(s["confidence"] * 100)
+            tag = "   <- Planner reuses this" if i == 0 else ""
+            print(f"\n  tool order    : {s['strategy']}")
+            print(
+                f"  confidence    : {pct}% "
+                f"({s['success_count']}/{s['times_used']} successful){tag}"
+            )
+            print(f"  avg score     : {s['avg_score']:.2f}")
+            print(f"  last used at  : {s['last_used_at']}")
 
     print("\n" + "-" * 74)
     if len(rows) >= 3:
